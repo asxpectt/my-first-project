@@ -1,0 +1,137 @@
+--- original/UIPackServer.luau
++++ fixed/UIPackServer.luau
+@@ -19,6 +19,7 @@
+ local rng = Random.new()
+ local data = {}      -- [player] = table
+ local passCache = {} -- [player] = { [passKey] = true }
++local lastCash = setmetatable({}, { __mode = "k" }) -- [player] = Cash we last wrote to leaderstats
+ 
+ local function default()
+ 	return {
+@@ -124,7 +125,10 @@
+ 	local ls = p:FindFirstChild("leaderstats")
+ 	if ls then
+ 		local cash, reb = ls:FindFirstChild("Cash"), ls:FindFirstChild("Rebirths")
+-		if cash then cash.Value = d.Cash end
++		if cash then
++			lastCash[p] = d.Cash
++			cash.Value = d.Cash
++		end
+ 		if reb then reb.Value = d.Rebirths end
+ 	end
+ 	local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+@@ -205,6 +209,14 @@
+ 	end
+ 	if not ls:FindFirstChild("Cash") then local v = Instance.new("NumberValue") v.Name = "Cash" v.Parent = ls end
+ 	if not ls:FindFirstChild("Rebirths") then local v = Instance.new("IntValue") v.Name = "Rebirths" v.Parent = ls end
++	-- Other scripts (MainHUD rewards, codes, wheel...) add to leaderstats.Cash directly.
++	-- Add those changes to our data so sync() doesn't wipe them.
++	ls.Cash.Changed:Connect(function(v)
++		local d2 = data[p]
++		if not d2 or lastCash[p] == nil or v == lastCash[p] then return end
++		d2.Cash += v - lastCash[p]
++		sync(p)
++	end)
+ 	p:SetAttribute("FriendBoost", friendBoost(p))
+ 	for _, o in Players:GetPlayers() do
+ 		if o ~= p and data[o] then o:SetAttribute("FriendBoost", friendBoost(o)) end
+@@ -311,7 +323,7 @@
+ end
+ 
+ local giftTargets = {} -- [player] = userId they are gifting to
+-MarketplaceService.ProcessReceipt = function(info)
++require(game:GetService("ServerScriptService"):WaitForChild("ReceiptRouter")).add(function(info)
+ 	local p = Players:GetPlayerByUserId(info.PlayerId)
+ 	if not p or not data[p] then return Enum.ProductPurchaseDecision.NotProcessedYet end
+ 	for key, pr in C.Products do
+@@ -320,8 +332,8 @@
+ 			return Enum.ProductPurchaseDecision.PurchaseGranted
+ 		end
+ 	end
+-	return Enum.ProductPurchaseDecision.NotProcessedYet
+-end
++	return nil -- not one of ours: let the next handler try
++end)
+ MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(p, id, bought)
+ 	if bought and passCache[p] then passCache[p] = {} sync(p) end
+ end)
+--- original/HUDServer.luau
++++ fixed/HUDServer.luau
+@@ -95,9 +95,10 @@
+ 	data[player] = d
+ 	local leaderstats = player:FindFirstChild("leaderstats") or Instance.new("Folder")
+ 	leaderstats.Name = "leaderstats"
+-	local cash = leaderstats:FindFirstChild("Cash") or Instance.new("NumberValue")
++	local existing = leaderstats:FindFirstChild("Cash")
++	local cash = existing or Instance.new("NumberValue")
+ 	cash.Name = "Cash"
+-	cash.Value = d.Cash
++	if not existing then cash.Value = d.Cash end -- UIPackServer owns Cash when it made it first
+ 	cash.Parent = leaderstats
+ 	leaderstats.Parent = player
+ 	player:SetAttribute("JoinTime", d.JoinTime)
+@@ -241,7 +242,7 @@
+ for key, p in Config.Products do
+ 	if (p.GiftId or 0) ~= 0 then byGiftId[p.GiftId] = key end
+ end
+-MarketplaceService.ProcessReceipt = function(receipt)
++require(game:GetService("ServerScriptService"):WaitForChild("ReceiptRouter")).add(function(receipt)
+ 	local player = Players:GetPlayerByUserId(receipt.PlayerId)
+ 	local giftKey = byGiftId[receipt.ProductId]
+ 	if giftKey then
+@@ -262,12 +263,13 @@
+ 		return Enum.ProductPurchaseDecision.PurchaseGranted
+ 	end
+ 	local key = byProductId[receipt.ProductId]
+-	if not player or not key or not data[player] then return Enum.ProductPurchaseDecision.NotProcessedYet end
++	if not key then return nil end -- not one of ours: let the next handler try
++	if not player or not data[player] then return Enum.ProductPurchaseDecision.NotProcessedYet end
+ 	local msg = grant(player, Config.Products[key])
+ 	notify:FireClient(player, "Toast", "Purchased! " .. msg)
+ 	save(player)
+ 	return Enum.ProductPurchaseDecision.PurchaseGranted
+-end
++end)
+ MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player, passId, bought)
+ 	if not bought or not data[player] then return end
+ 	for key, p in Config.Products do
+--- original/Config.luau
++++ fixed/Config.luau
+@@ -18,7 +18,7 @@
+ 
+ C.StudioFreePurchases = true -- Studio only: products/passes with Id 0 are given for free so you can test
+ C.StartCash = 0
+-C.BonusCash = 1000000 -- one-time gift to every player (0 = off)
++C.BonusCash = 0 -- one-time gift to every player (0 = off). The kit shipped with 1000000 for testing.
+ C.CashPileAmount = 1000 -- touching the cash pile near spawn
+ C.CashPileCooldown = 15
+ C.Income = 0            -- cash per second before boosts (0 = no passive income; was 10)
+--- new file: ServerScriptService/ReceiptRouter.luau
+-- ReceiptRouter: the single MarketplaceService.ProcessReceipt for this game.
+-- Roblox allows only one ProcessReceipt. This kit has two purchase systems
+-- (UIPackServer and MainHUD's HUDServer), so each one adds a handler here.
+-- A handler returns a ProductPurchaseDecision for its own products, or nil if the
+-- product isn't one of its own, so the next handler can try.
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local handlers = {}
+
+MarketplaceService.ProcessReceipt = function(info)
+	for _, handler in handlers do
+		local ok, decision = pcall(handler, info)
+		if not ok then
+			warn("[ReceiptRouter]", decision)
+			return Enum.ProductPurchaseDecision.NotProcessedYet -- Roblox retries later
+		end
+		if decision ~= nil then
+			return decision
+		end
+	end
+	return Enum.ProductPurchaseDecision.NotProcessedYet
+end
+
+return {
+	add = function(handler)
+		table.insert(handlers, handler)
+	end,
+}
